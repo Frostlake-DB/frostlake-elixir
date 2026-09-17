@@ -31,5 +31,4 @@ verified against engines 0.0.7 and 0.1.0.
   reused socket is retried, and a socket the server dropped while it was idle is replaced
   before anything is written to it.
 - Tests: 126 and a doctest that need no engine, and — with `FROSTLAKE_CLASSPATH` set — 27
-  integration tests plus the engine-owned JSON testkit suites: against engine 0.1.0, 6959 tests in
-  all with no failures and 13 skipped.
+  integration tests against a real engine, passing on engines 0.0.7 and 0.1.0.

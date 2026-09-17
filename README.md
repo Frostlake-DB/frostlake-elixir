@@ -15,13 +15,15 @@ this is a floor rather than a lockstep pin.
 
 ## Installation
 
-Not on Hex yet. Point at the repository, or at a checkout:
+From [Hex](https://hex.pm/packages/frostlake):
 
 ```elixir
 def deps do
-  [{:frostlake, github: "Frostlake-DB/frostlake-elixir"}]
+  [{:frostlake, "~> 0.1.0"}]
 end
 ```
+
+A script or a Livebook can pull it in with `Mix.install([{:frostlake, "~> 0.1.0"}])`.
 
 ## Usage
 
@@ -321,29 +323,8 @@ the engine jar and its dependency jars, joined with `:` (`;` on Windows):
 JAVA_HOME=/path/to/jdk17 FROSTLAKE_CLASSPATH="<engine jar>:<dependency jars>" mix test
 ```
 
-That run also includes the **engine-owned, language-neutral JSON suites**
-(`engine/src/test/resources/testkit/suites/*.json`, spec in `SCHEMA.md` beside them), one ExUnit
-test per case, every statement travelling `connect` → HTTP → `DatabaseHttpServer`. The engine
-owns the definitions and this repo only holds the runner, so suites added on the engine side are
-picked up with no driver change. Point `FROSTLAKE_TESTKIT_SUITES` at them, or check `frostlake`
-out beside this repo.
-
-Against engine 0.1.0 and the suites tagged with it the whole run passes with no failures:
-**6959 tests, 13 skipped** at the time of writing, the skips being the suites' own `skip`
-declarations. That total tracks however many suites the engine currently ships — the corpus grows
-on the engine side — so treat it as a reading rather than a fixed number; what stays true is that
-the run is clean.
-
-The run is deterministic on purpose (`seed: 0`). The suites are an ordered corpus: account-level
-objects — a warehouse, an internal stage — outlive the per-test `CREATE OR REPLACE DATABASE
-test_db` that isolates everything else, so a case creating `wh` with no `IF NOT EXISTS` only
-passes when it runs before the suites that create the same warehouse. The reference runners walk
-the files in order, and so does this one.
-
-One capability note prints at the end, for the error codes described under
-[Known limitations](#known-limitations). It is not a failure: it records a check this transport
-cannot express, so the day the protocol carries an error code the check lights up without a test
-changing.
+Against engines 0.0.7 and 0.1.0 that run passes with no failures: **27 integration tests** on top
+of the unit tests, every statement travelling `connect` → HTTP → `DatabaseHttpServer`.
 
 The engine the tests boot is pinned to a directory of that run's own (`_build/engine-<port>`,
 emptied before boot), because a default-configured engine persists its catalog and its internal
