@@ -6,12 +6,14 @@ HTTP protocol against a running `DatabaseHttpServer`. Elixir 1.14+ on OTP 25+, `
 
 ## Engine version
 
-Requires a Frostlake engine **0.0.7 or newer**, and is verified against 0.0.7 and 0.1.0. Ask a
+Requires a Frostlake engine **0.2.0 or newer**. Ask a
 running server which one it is with `SELECT CURRENT_VERSION()` — every release answers it, so the
 check works against any engine.
 
 The driver versions independently of the engine: it speaks the HTTP protocol, not the jar, so
-this is a floor rather than a lockstep pin.
+this is a floor rather than a lockstep pin. Engines from 0.1.0 add two things the driver uses when
+they are there: releasing a session on close, and refusing a session they no longer hold rather
+than quietly replacing it (see [Session lifetime](#session-lifetime)).
 
 ## Installation
 
@@ -236,7 +238,7 @@ want.
 
 ### Errors
 
-Three exceptions, by which side the failure came from — the distinction a caller actually
+Four exceptions, by which side the failure came from — the distinction a caller actually
 branches on:
 
 - **`Frostlake.QueryError`** — the engine refused the statement. `message` is the engine's own
@@ -245,6 +247,9 @@ branches on:
   socket died, the deadline passed, or a proxy replied with something that is not a Frostlake
   response. A statement that failed this way has an *unknown* fate, so it must not be blindly
   retried — re-running an `INSERT` would duplicate it.
+- **`Frostlake.SessionLostError`** — the engine no longer holds the connection's session, which
+  held an open transaction or a moved context, so the statement did not run (see
+  [Session lifetime](#session-lifetime)). The connection stays usable.
 - **`Frostlake.UsageError`** — the driver never sent it: a malformed DSN, a closed connection, a
   bind value with no SQL equivalent, a placeholder left without an argument.
 
@@ -277,19 +282,52 @@ For a pool, put several connections under your own supervisor and pick between t
 ships no pool of its own, because a connection is one session and pooling sessions is a policy
 question rather than a transport one.
 
+### Session lifetime
+
+`close/1` hands the session back to the engine. From engine 0.1.0 on that ends it on the server
+at once, with `DELETE /api/sessions/{id}`, and the engine rolls back a transaction left open in
+it, so closed connections do not pile up there. The release is best effort: it waits no longer
+than the connection's `timeout` or five seconds, whichever is shorter, and `close/1` answers `:ok`
+whatever the engine says. An engine before 0.1.0 has no such endpoint and is not asked; its
+sessions last until its own 30-minute idle sweep. A connection whose owner finishes is closed the
+same way.
+
+The engine ends a session that has sat idle for 30 minutes, releases one on request, and loses
+every one to a restart. Once an answer has shown that the engine marks `newSession` (0.1.0 and
+later), every request naming the session carries `requireSession: true`, so a statement naming a
+session the engine no longer holds is refused with a 404 before anything runs. The connection then
+drops the session and:
+
+- when the lost session held an open transaction — from `begin/2` or `transaction/3`, or a SQL
+  `BEGIN` / `START TRANSACTION` — answers `{:error, %Frostlake.SessionLostError{}}`: the
+  transaction is gone and the statement did not run. A `commit/2` of that transaction answers the
+  same error without sending anything, and a `rollback/2` answers `:ok`, so `transaction/3` never
+  reports it committed;
+- when a statement had moved the session's context — `USE`, `SET` / `UNSET`, `ALTER SESSION`, a
+  temporary object, or a `CREATE` / `DROP` of a database or schema — answers the same error: the
+  context went with the session, and the statement was not re-run;
+- otherwise puts the DSN's role, warehouse, database and schema on a fresh session and sends the
+  statement once more. A second refusal answers the error too.
+
+Either way the connection carries on, and its next statement starts a fresh session on the DSN's
+scope. Should an answer still say that the engine replaced the session, the DSN's scope goes back
+on before the next statement.
+
+An engine before 0.1.0 is never sent `requireSession`. It re-creates a lost session under the same
+id at the server's default scope, and nothing in its answer says so. So a connection to one that
+has been idle longer than `idleLimit` gets the DSN's scope re-applied ahead of its next statement,
+but not once you have issued your own `USE`, since the DSN no longer describes where you are.
+That check does not apply to an engine from 0.1.0 on.
+
 ## Known limitations
 
-- **Server sessions are not released on close.** Engine 0.1.0 can end a session
-  (`DELETE /api/sessions/{id}`), but the driver does not call it yet, and earlier engines have no
-  such endpoint. A closed connection's session therefore lingers until the engine's own 30-minute
-  idle sweep reclaims it, and connection churn accrues server-side sessions.
-- **A session idle past that sweep resumes at the server's default scope**, because the engine
-  re-creates an expired session under the very same id. Engine 0.1.0 marks such an answer
-  `newSession`, but the driver does not read the mark yet, and before 0.1.0 nothing in the answer
-  tells. The driver covers this by re-applying the DSN's scope to a connection that has been idle
-  longer than `idleLimit`, but anything else the session held (a session variable, an
-  `ALTER SESSION` setting) is gone. It stops doing so once the caller has issued their own `USE`,
-  since the DSN no longer describes where they are.
+- **On an engine before 0.1.0 a lost session goes unnoticed.** Such an engine runs the statement
+  that names it in a fresh session at the server's default scope, and its answer does not say so.
+  The idle check covers the usual cause, the engine's idle sweep, ahead of time, but not a session
+  released elsewhere or a server restart, and anything the session held is gone either way.
+- **A connection that dies without closing keeps its session.** One taken down with a crashing
+  owner, or stopped by its supervisor, exits without its cleanup, so its session waits for the
+  engine's idle sweep.
 - **Temporal values keep microseconds.** Engine 0.1.0 sends a timestamp or a time with all nine
   fractional digits, but Elixir's `Time`, `NaiveDateTime` and `DateTime` hold six, so the last
   three are dropped. Engines before 0.1.0 send milliseconds, and a `TIME` in whole seconds.
@@ -313,7 +351,7 @@ page, a socket dropped between statements, a reply that never comes:
 mix test
 ```
 
-**126 tests and a doctest, no failures**, and the tests that need an engine are excluded rather
+**152 tests and a doctest, no failures**, and the tests that need an engine are excluded rather
 than passing on a stub.
 
 The integration tests additionally boot a real `DatabaseHttpServer` from an engine classpath —
@@ -323,8 +361,18 @@ the engine jar and its dependency jars, joined with `:` (`;` on Windows):
 JAVA_HOME=/path/to/jdk17 FROSTLAKE_CLASSPATH="<engine jar>:<dependency jars>" mix test
 ```
 
-Against engines 0.0.7 and 0.1.0 that run passes with no failures: **27 integration tests** on top
+Against engines 0.0.7 and 0.1.0 that run passes with no failures: **33 integration tests** on top
 of the unit tests, every statement travelling `connect` → HTTP → `DatabaseHttpServer`.
+
+With `FL_CORPUS` set to the frostlake repo's `engine/src/test/resources/testkit`, best given as an
+absolute path, the same run also replays the engine-owned, language-neutral JSON suites there
+(`suites/*.json`, spec in `SCHEMA.md` beside them), one ExUnit test per case through this driver.
+Without it the corpus is a single skipped test.
+
+```bash
+FL_CORPUS=/path/to/frostlake/engine/src/test/resources/testkit \
+  JAVA_HOME=/path/to/jdk17 FROSTLAKE_CLASSPATH="<engine jar>:<dependency jars>" mix test
+```
 
 The engine the tests boot is pinned to a directory of that run's own (`_build/engine-<port>`,
 emptied before boot), because a default-configured engine persists its catalog and its internal

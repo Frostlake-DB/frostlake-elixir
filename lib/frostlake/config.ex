@@ -52,8 +52,11 @@ defmodule Frostlake.Config do
   def default_timeout, do: @default_timeout
 
   @doc """
-  The engine reclaims a session after 30 minutes idle. Past that the driver has
-  to assume its own is gone, because nothing in a response says so.
+  The engine reclaims a session after 30 minutes idle. Past that, on an engine
+  before 0.1.0, the driver assumes its own is gone and re-applies the DSN's scope
+  ahead of the next statement, because nothing in that engine's answers says so.
+  An engine from 0.1.0 on is asked to refuse a session it no longer holds
+  instead (`requireSession`), so the limit does not apply to it.
   """
   def default_idle_limit, do: @default_idle_limit
 

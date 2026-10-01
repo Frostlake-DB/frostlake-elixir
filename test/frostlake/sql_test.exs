@@ -67,6 +67,59 @@ defmodule Frostlake.SQLTest do
     end
   end
 
+  describe "touches_session?/1" do
+    test "a moved scope, a session setting or a temporary object is state a fresh session lacks" do
+      for statement <- [
+            "USE SCHEMA s",
+            "use database d",
+            "SET x = 1",
+            "UNSET x",
+            "ALTER SESSION SET TIMEZONE = 'UTC'",
+            "CREATE OR REPLACE DATABASE d",
+            "CREATE SCHEMA IF NOT EXISTS s",
+            "DROP DATABASE d",
+            "CREATE TEMPORARY TABLE t (a INT)",
+            "CREATE OR REPLACE TEMP TABLE t (a INT)",
+            "CREATE LOCAL TEMPORARY TABLE t (a INT)",
+            "/* lead */ use role r"
+          ] do
+        assert SQL.touches_session?(statement), statement
+      end
+    end
+
+    test "tables, views and queries leave the session as it was" do
+      for statement <- [
+            "CREATE TABLE t (a INT)",
+            "CREATE OR REPLACE TRANSIENT TABLE t (a INT)",
+            "ALTER TABLE t ADD COLUMN b INT",
+            "SELECT 1",
+            "INSERT INTO t VALUES (1)",
+            "SELECT 'USE SCHEMA s'",
+            ""
+          ] do
+        refute SQL.touches_session?(statement), statement
+      end
+    end
+  end
+
+  describe "transaction_effect/1" do
+    test "BEGIN and START TRANSACTION open a transaction, COMMIT and ROLLBACK end it" do
+      assert SQL.transaction_effect("BEGIN") == :begins
+      assert SQL.transaction_effect("begin transaction") == :begins
+      assert SQL.transaction_effect("BEGIN WORK") == :begins
+      assert SQL.transaction_effect("BEGIN NAME t1") == :begins
+      assert SQL.transaction_effect("START TRANSACTION") == :begins
+      assert SQL.transaction_effect("COMMIT") == :ends
+      assert SQL.transaction_effect("ROLLBACK WORK") == :ends
+      assert SQL.transaction_effect("SELECT 1") == :none
+    end
+
+    test "a BEGIN followed by a statement opens a scripting block, not a transaction" do
+      [block | _] = SQL.split_statements("BEGIN LET x := 1; RETURN x; END")
+      assert SQL.transaction_effect(block) == :none
+    end
+  end
+
   describe "leading_words/2" do
     test "reads up to n upper-cased words" do
       assert SQL.leading_words("  create or replace table t", 3) == ["CREATE", "OR", "REPLACE"]

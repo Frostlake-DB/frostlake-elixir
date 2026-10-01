@@ -20,11 +20,13 @@ defmodule Frostlake do
       :ok = Frostlake.close(conn)
 
   Every call answers `{:ok, value}` or `{:error, exception}`; the `!` variants
-  raise instead. The three exceptions say which kind of failure it was, which is
-  the distinction a caller actually branches on: `Frostlake.QueryError` (the
-  engine refused the statement), `Frostlake.ConnectionError` (the request never
-  became an answer, so the statement's fate is unknown) and
-  `Frostlake.UsageError` (the driver never sent it).
+  raise instead. The exceptions say which kind of failure it was, which is the
+  distinction a caller actually branches on: `Frostlake.QueryError` (the engine
+  refused the statement), `Frostlake.ConnectionError` (the request never became
+  an answer, so the statement's fate is unknown), `Frostlake.SessionLostError`
+  (the engine no longer holds the session, which held a transaction or a moved
+  context, so the statement did not run) and `Frostlake.UsageError` (the driver
+  never sent it).
 
   ## Parameters
 
@@ -53,7 +55,10 @@ defmodule Frostlake do
 
   @typedoc "Anything the driver reports as a failure."
   @type error ::
-          Frostlake.QueryError.t() | Frostlake.ConnectionError.t() | Frostlake.UsageError.t()
+          Frostlake.QueryError.t()
+          | Frostlake.ConnectionError.t()
+          | Frostlake.SessionLostError.t()
+          | Frostlake.UsageError.t()
 
   @typedoc "Positional parameters as a list, or named ones as a map or keyword list."
   @type params :: list() | map()
@@ -193,11 +198,13 @@ defmodule Frostlake do
   end
 
   @doc """
-  Closes the connection.
+  Closes the connection and hands its session back to the engine.
 
-  A statement already in flight finishes first. The HTTP API has no endpoint for
-  ending a session, so the engine's own idle sweep is what reclaims the session
-  behind it.
+  A statement already in flight finishes first. From engine 0.1.0 on the
+  session is then ended, which rolls back a transaction left open in it; an
+  earlier engine keeps it until its own idle sweep. Closing always succeeds,
+  and waits no longer than the connection's timeout or five seconds for the
+  engine to answer.
   """
   @spec close(conn()) :: :ok
   defdelegate close(conn), to: Connection

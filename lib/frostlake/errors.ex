@@ -40,6 +40,27 @@ defmodule Frostlake.ConnectionError do
         }
 end
 
+defmodule Frostlake.SessionLostError do
+  @moduledoc """
+  The engine no longer holds the connection's session, and the statement did
+  not run.
+
+  The session expired, was released, or went with a server restart, and it held
+  something a fresh one cannot reproduce: an open transaction, or context set
+  up with `USE`, `SET`, `ALTER SESSION` or a temporary object. Re-running the
+  statement in a fresh session would put it somewhere its author did not
+  intend, so the driver reports the loss instead. The connection stays usable:
+  its next statement starts a fresh session on the DSN's scope.
+
+  `:statement` is the statement that did not run, bound as it would have been
+  sent, so treat it as sensitive the way `Frostlake.QueryError`'s is.
+  """
+
+  defexception [:message, :statement]
+
+  @type t :: %__MODULE__{message: String.t(), statement: String.t() | nil}
+end
+
 defmodule Frostlake.UsageError do
   @moduledoc """
   The driver never sent it.

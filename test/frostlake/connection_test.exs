@@ -9,7 +9,8 @@ defmodule Frostlake.ConnectionTest do
 
   @moduletag :server
 
-  alias Frostlake.{QueryError, Result, TestServer, UsageError}
+  alias Frostlake.{Config, DSN, HTTP, JSON, QueryError, Result, SessionLostError, TestServer}
+  alias Frostlake.UsageError
 
   setup do
     {:ok, conn} = Frostlake.connect(TestServer.dsn())
@@ -279,6 +280,121 @@ defmodule Frostlake.ConnectionTest do
       assert {:ok, result} = Frostlake.execute(conn, "SELECT COUNT(*) FROM counter")
       assert Result.value(result) == 10
     end
+
+    test "closing hands the session back to the engine, from engine 0.1.0 on", %{conn: conn} do
+      # Earlier engines have no endpoint for it, and keep a session until their
+      # idle sweep.
+      if engine_version(conn) >= {0, 1, 0} do
+        before = active_sessions()
+        {:ok, other} = Frostlake.connect(TestServer.dsn())
+        {:ok, _} = Frostlake.execute(other, "SELECT 1")
+        assert active_sessions() == before + 1
+
+        assert :ok = Frostlake.close(other)
+        assert active_sessions() == before
+      end
+    end
+
+    test "closing rolls back a transaction left open, from engine 0.1.0 on", %{conn: conn} do
+      if engine_version(conn) >= {0, 1, 0} do
+        {:ok, _} = Frostlake.execute(conn, "CREATE TABLE left_open (n INTEGER)")
+
+        {:ok, other} =
+          Frostlake.connect(TestServer.dsn(), database: "elixir_test_db", schema: "test_schema")
+
+        assert :ok = Frostlake.begin(other)
+        {:ok, _} = Frostlake.execute(other, "INSERT INTO left_open VALUES (1)")
+        open = open_transactions(conn)
+
+        assert :ok = Frostlake.close(other)
+        assert open_transactions(conn) == open - 1
+        assert {:ok, result} = Frostlake.execute(conn, "SELECT COUNT(*) FROM left_open")
+        assert Result.value(result) == 0
+      end
+    end
+
+    test "a session the engine replaced goes back on the DSN's scope, from engine 0.1.0 on",
+         %{conn: conn} do
+      # Earlier engines do not say when they replaced a session.
+      if engine_version(conn) >= {0, 1, 0} do
+        {:ok, _} = Frostlake.execute(spare_connection(), "CREATE OR REPLACE DATABASE replaced_db")
+        {:ok, scoped} = Frostlake.connect(TestServer.dsn(), database: "replaced_db")
+        on_exit(fn -> Frostlake.close(scoped) end)
+
+        # Ended behind the connection's back, as the engine's idle sweep or a
+        # restart would. The engine refuses the next statement, and the
+        # connection puts the DSN's scope on a fresh session and sends it again.
+        assert {200, _} = raw("DELETE", "/api/sessions/" <> Frostlake.session_id(scoped))
+        {:ok, _} = Frostlake.execute(scoped, "SELECT 1")
+
+        assert {:ok, result} = Frostlake.execute(scoped, "SELECT CURRENT_DATABASE()")
+        assert Result.value(result) == "REPLACED_DB"
+      end
+    end
+
+    test "the statement that meets a lost session runs on the DSN's scope, from engine 0.1.0 on",
+         %{conn: conn} do
+      # Earlier engines cannot refuse a session they no longer hold.
+      if engine_version(conn) >= {0, 1, 0} do
+        {:ok, _} =
+          Frostlake.execute(spare_connection(), "CREATE OR REPLACE DATABASE recovered_db")
+
+        {:ok, scoped} = Frostlake.connect(TestServer.dsn(), database: "recovered_db")
+        on_exit(fn -> Frostlake.close(scoped) end)
+        lost = Frostlake.session_id(scoped)
+        assert {200, _} = raw("DELETE", "/api/sessions/" <> lost)
+
+        assert {:ok, result} = Frostlake.execute(scoped, "SELECT CURRENT_DATABASE()")
+        assert Result.value(result) == "RECOVERED_DB"
+        refute Frostlake.session_id(scoped) == lost
+      end
+    end
+
+    test "a lost session with a transaction open is reported and nothing runs, from engine 0.1.0 on",
+         %{conn: conn} do
+      if engine_version(conn) >= {0, 1, 0} do
+        {:ok, _} = Frostlake.execute(conn, "CREATE TABLE lost_tx (n INTEGER)")
+
+        {:ok, other} =
+          Frostlake.connect(TestServer.dsn(), database: "elixir_test_db", schema: "test_schema")
+
+        on_exit(fn -> Frostlake.close(other) end)
+        assert :ok = Frostlake.begin(other)
+        {:ok, _} = Frostlake.execute(other, "INSERT INTO lost_tx VALUES (1)")
+        assert {200, _} = raw("DELETE", "/api/sessions/" <> Frostlake.session_id(other))
+
+        assert {:error, %SessionLostError{} = error} =
+                 Frostlake.execute(other, "INSERT INTO lost_tx VALUES (2)")
+
+        assert error.message =~ "transaction"
+        # The release rolled the first row back, and the second statement never ran.
+        assert {:ok, result} = Frostlake.execute(conn, "SELECT COUNT(*) FROM lost_tx")
+        assert Result.value(result) == 0
+        # The connection carries on, in a fresh session on the DSN's scope.
+        assert {:ok, result} = Frostlake.execute(other, "SELECT CURRENT_SCHEMA()")
+        assert Result.value(result) == "TEST_SCHEMA"
+      end
+    end
+
+    test "a lost session whose schema moved is reported, from engine 0.1.0 on", %{conn: conn} do
+      if engine_version(conn) >= {0, 1, 0} do
+        {:ok, _} = Frostlake.execute(conn, "CREATE OR REPLACE SCHEMA moved_schema")
+
+        {:ok, other} =
+          Frostlake.connect(TestServer.dsn(), database: "elixir_test_db", schema: "test_schema")
+
+        on_exit(fn -> Frostlake.close(other) end)
+        {:ok, _} = Frostlake.execute(other, "USE SCHEMA moved_schema")
+        assert {200, _} = raw("DELETE", "/api/sessions/" <> Frostlake.session_id(other))
+
+        assert {:error, %SessionLostError{} = error} =
+                 Frostlake.execute(other, "SELECT CURRENT_SCHEMA()")
+
+        assert error.message =~ "context"
+        assert {:ok, result} = Frostlake.execute(other, "SELECT CURRENT_SCHEMA()")
+        assert Result.value(result) == "TEST_SCHEMA"
+      end
+    end
   end
 
   describe "transactions" do
@@ -351,6 +467,34 @@ defmodule Frostlake.ConnectionTest do
     {:ok, conn} = Frostlake.connect(TestServer.dsn())
     on_exit(fn -> Frostlake.close(conn) end)
     conn
+  end
+
+  # One request to the engine from outside any connection, over the driver's
+  # own transport.
+  defp raw(method, path) do
+    config = DSN.parse!(TestServer.dsn())
+    {:ok, socket} = HTTP.connect(config)
+
+    try do
+      {:ok, status, _headers, body} =
+        HTTP.request(socket, method, path, Config.host_header(config), nil, HTTP.deadline(30_000))
+
+      {status, body}
+    after
+      HTTP.close(socket)
+    end
+  end
+
+  # The engine's own count of the sessions it holds: a released session and
+  # one left for the idle sweep look alike from the client.
+  defp active_sessions do
+    {200, body} = raw("GET", "/api/health")
+    JSON.decode!(body)["activeSessions"]
+  end
+
+  defp open_transactions(conn) do
+    {:ok, result} = Frostlake.execute(conn, "SHOW TRANSACTIONS")
+    result.num_rows
   end
 
   # The engine's release as a comparable tuple: "0.1.1-SNAPSHOT" is {0, 1, 1}.

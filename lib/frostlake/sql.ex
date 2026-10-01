@@ -215,6 +215,67 @@ defmodule Frostlake.SQL do
     if word in @object_modifiers, do: names_object?(rest, want), else: word in want
   end
 
+  # Every modifier that may sit between CREATE, DROP or ALTER and the kind of
+  # object being named, for touches_session?/1.
+  @session_modifiers ~w(OR REPLACE TRANSIENT TEMPORARY TEMP VOLATILE LOCAL GLOBAL SECURE IF NOT
+                        EXISTS PUBLIC PRIVATE ICEBERG DYNAMIC HYBRID EVENT RECURSIVE MATERIALIZED
+                        EXTERNAL)
+
+  @temporary ~w(TEMPORARY TEMP VOLATILE)
+
+  @doc """
+  Whether a statement leaves behind state a fresh session would not have.
+
+  That is a moved scope (`USE`, a `CREATE` or `DROP` of a `DATABASE` or
+  `SCHEMA`), a session variable or setting (`SET`, `UNSET`, `ALTER SESSION`),
+  or a temporary object. `CREATE TABLE` and its kind leave the session as it
+  was. Takes one statement; split a request with `split_statements/1` first.
+  """
+  @spec touches_session?(binary()) :: boolean()
+  def touches_session?(statement) do
+    case leading_words(statement, 16) do
+      [verb | _rest] when verb in ["USE", "SET", "UNSET"] ->
+        true
+
+      ["ALTER" | rest] ->
+        match?(["SESSION" | _], Enum.drop_while(rest, &(&1 in @session_modifiers)))
+
+      [verb | rest] when verb in ["CREATE", "DROP"] ->
+        case Enum.drop_while(rest, &(&1 in @session_modifiers)) do
+          [kind | _] when kind in ["DATABASE", "SCHEMA"] ->
+            true
+
+          _ ->
+            verb == "CREATE" and
+              rest
+              |> Enum.take_while(&(&1 in @session_modifiers))
+              |> Enum.any?(&(&1 in @temporary))
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  @doc """
+  What a statement does to the session's transaction: `:begins`, `:ends` or
+  `:none`.
+
+  `BEGIN` on its own, or with `TRANSACTION`, `WORK` or `NAME`, opens one, as
+  does `START TRANSACTION`; `BEGIN` followed by a statement opens a scripting
+  block instead. `COMMIT` and `ROLLBACK` end one.
+  """
+  @spec transaction_effect(binary()) :: :begins | :ends | :none
+  def transaction_effect(statement) do
+    case leading_words(statement, 2) do
+      ["BEGIN"] -> :begins
+      ["BEGIN", word] when word in ["TRANSACTION", "WORK", "NAME"] -> :begins
+      ["START", "TRANSACTION"] -> :begins
+      [verb | _rest] when verb in ["COMMIT", "ROLLBACK"] -> :ends
+      _ -> :none
+    end
+  end
+
   @doc """
   Up to `count` words from the start of a statement, upper-cased, skipping
   whitespace and comments and stopping at the first thing that is not a word.

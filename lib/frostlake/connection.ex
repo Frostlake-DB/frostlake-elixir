@@ -24,13 +24,17 @@ defmodule Frostlake.Connection do
   use GenServer
 
   alias Frostlake.{Binding, Column, Config, ConnectionError, DSN, HTTP, JSON}
-  alias Frostlake.{QueryError, Result, SQL, UsageError, Values}
+  alias Frostlake.{QueryError, Result, SessionLostError, SQL, UsageError, Values}
 
   @execute_path "/api/execute"
   @health_path "/api/health"
+  @sessions_path "/api/sessions/"
 
   # How much of an unrecognisable response is quoted back in an error.
   @max_error_body 512
+
+  # The most closing may spend handing the session back to the engine.
+  @release_limit 5_000
 
   defmodule State do
     @moduledoc false
@@ -45,6 +49,17 @@ defmodule Frostlake.Connection do
       pending_use: [],
       session_defaults: [],
       session_touched: false,
+      # Whether the engine marks its answers `newSession`, as engines from 0.1.0
+      # on do; nil until an answer names a session.
+      tracks_sessions: nil,
+      # Whether a statement left state behind that a fresh session would not
+      # have (see SQL.touches_session?/1), so that losing the session loses it.
+      dirty: false,
+      # Whether a transaction is open on the session, begun by begin/2 or in SQL.
+      in_transaction: false,
+      # Set once a transaction went with a lost session, until commit/2,
+      # rollback/2 or begin/2 hears of it: a commit must not answer :ok for it.
+      transaction_lost: false,
       # The monitor on the process that opened the connection, if any.
       owner_ref: nil,
       # The time limit of the call in progress, for the message a timeout gets.
@@ -203,10 +218,15 @@ defmodule Frostlake.Connection do
   def config(conn), do: call(conn, :config)
 
   @doc """
-  Closes the connection.
+  Closes the connection and hands its session back to the engine.
 
   A statement already in flight finishes first — its caller gets an answer
-  rather than a torn socket.
+  rather than a torn socket. From engine 0.1.0 on the session is then ended
+  with `DELETE /api/sessions/{id}`, which rolls back a transaction left open in
+  it; an earlier engine has no such endpoint and keeps the session until its
+  own idle sweep. Releasing is best effort: it waits no longer than the
+  connection's timeout or five seconds, whichever is shorter, and closing
+  succeeds whatever the engine answers, or if it does not answer at all.
   """
   @spec close(conn()) :: :ok
   def close(conn) do
@@ -262,9 +282,14 @@ defmodule Frostlake.Connection do
     # The declared count travels with the caller's statement only: the USE
     # statements drained ahead of it are one statement each.
     with {:ok, state} <- drain_pending_use(restore_session_defaults(state), deadline),
-         {:ok, body, state} <- round_trip(state, rendered, deadline, count) do
+         {:ok, body, state} <- run(state, rendered, deadline, count) do
+      # A statement that moves the session keeps the DSN's defaults off it from
+      # then on. Not one that met a replaced session: the DSN's scope is queued
+      # to go back on over it (see note_new_session/3).
       state =
-        if SQL.changes_session_scope?(sql), do: %{state | session_touched: true}, else: state
+        if SQL.changes_session_scope?(sql) and state.pending_use == [],
+          do: %{state | session_touched: true},
+          else: state
 
       {:reply, {:ok, shape_results(body)}, state}
     else
@@ -295,10 +320,10 @@ defmodule Frostlake.Connection do
   end
 
   def handle_call({:begin, timeout}, _from, state) do
-    state = with_limit(state, timeout)
+    state = with_limit(%{state | transaction_lost: false}, timeout)
 
-    case round_trip(%{state | auto_commit: false}, "BEGIN", deadline(state, timeout)) do
-      {:ok, _body, state} -> {:reply, :ok, state}
+    case run(%{state | auto_commit: false}, "BEGIN", deadline(state, timeout)) do
+      {:ok, _body, state} -> {:reply, :ok, %{state | auto_commit: false}}
       {:error, error, state} -> {:reply, {:error, error}, %{state | auto_commit: true}}
     end
   end
@@ -317,42 +342,236 @@ defmodule Frostlake.Connection do
 
   @impl true
   def terminate(_reason, state) do
-    # The HTTP API has no endpoint for ending a session, so the engine's own
-    # idle sweep is what reclaims the session behind this socket; closing frees
-    # the socket itself.
+    state = release_session(state)
     HTTP.close(state.socket)
     :ok
+  end
+
+  # Engine 0.1.0 ends a session on `DELETE /api/sessions/{id}` and rolls back a
+  # transaction left open in it; otherwise the session, and whatever it holds,
+  # lingers until the engine's idle sweep reclaims it. Closing must neither fail
+  # nor hang on it: the answer is ignored whatever it says — a 404 for a session
+  # already gone included — a transport failure is swallowed, and the request
+  # gets the connection's own timeout or five seconds, whichever is shorter. An
+  # engine that never marks an answer `newSession` predates the endpoint and is
+  # not asked.
+  defp release_session(%State{session_id: nil} = state), do: state
+  defp release_session(%State{tracks_sessions: false} = state), do: state
+
+  defp release_session(%State{config: config} = state) do
+    limit = release_limit(config.timeout)
+    connect_timeout = release_limit(config.connect_timeout)
+    state = %{state | config: %{config | connect_timeout: connect_timeout}, limit: limit}
+    path = @sessions_path <> URI.encode(state.session_id, &URI.char_unreserved?/1)
+
+    case perform(state, "DELETE", path, nil, HTTP.deadline(limit)) do
+      {:ok, _status, _response, state} -> state
+      {:error, _error, state} -> state
+    end
+  catch
+    _kind, _reason -> state
+  end
+
+  # A limit of 0 means none at all, which closing does not get.
+  defp release_limit(0), do: @release_limit
+  defp release_limit(limit), do: min(limit, @release_limit)
+
+  # A transaction that went with a lost session was reported by the statement
+  # that met the loss. It cannot be committed, and nothing is left to roll back,
+  # so neither sends anything; a commit says so rather than answer :ok.
+  defp finish_transaction(%State{transaction_lost: true} = state, statement, _timeout) do
+    state = %{state | transaction_lost: false, auto_commit: true}
+
+    if statement == "COMMIT" do
+      error = %SessionLostError{
+        message:
+          "the engine no longer holds this connection's session, so the transaction went " <>
+            "with it and nothing in it was committed",
+        statement: statement
+      }
+
+      {:reply, {:error, error}, state}
+    else
+      {:reply, :ok, state}
+    end
   end
 
   defp finish_transaction(state, statement, timeout) do
     state = with_limit(state, timeout)
 
-    case round_trip(state, statement, deadline(state, timeout)) do
-      {:ok, _body, state} -> {:reply, :ok, %{state | auto_commit: true}}
-      {:error, error, state} -> {:reply, {:error, error}, %{state | auto_commit: true}}
+    case run(state, statement, deadline(state, timeout)) do
+      # The answer said the engine ran it in a fresh session: the transaction had
+      # gone before it arrived.
+      {:ok, _body, %State{transaction_lost: true} = state} ->
+        finish_transaction(state, statement, timeout)
+
+      {:ok, _body, state} ->
+        {:reply, :ok, %{state | auto_commit: true}}
+
+      {:error, error, state} ->
+        {:reply, {:error, error}, %{state | auto_commit: true, transaction_lost: false}}
     end
   end
 
   # Each USE leaves the queue only once it has succeeded. A DSN naming a
   # database that does not exist has to keep failing; the alternative is later
   # statements quietly running in the default scope.
-  defp drain_pending_use(%State{pending_use: []} = state, _deadline), do: {:ok, state}
+  #
+  # A USE that meets a replaced session puts the whole scope back in the queue
+  # (see note_new_session/3), since those sent before it went with the old
+  # session; when it was not the first of the scope, the queue starts over. Only
+  # once: an engine that replaces the session again within the same few
+  # requests is keeping none, and another pass would not change that.
+  defp drain_pending_use(state, deadline, restarted \\ false)
 
-  defp drain_pending_use(%State{pending_use: [statement | rest]} = state, deadline) do
+  defp drain_pending_use(%State{pending_use: []} = state, _deadline, _restarted), do: {:ok, state}
+
+  defp drain_pending_use(%State{pending_use: [statement | rest]} = state, deadline, restarted) do
+    queue = state.pending_use
+
     case round_trip(state, statement, deadline) do
-      {:ok, _body, state} -> drain_pending_use(%{state | pending_use: rest}, deadline)
-      {:error, error, state} -> {:error, error, state}
+      {:ok, _body, %State{pending_use: ^queue} = state} ->
+        drain_pending_use(%{state | pending_use: rest}, deadline, restarted)
+
+      {:ok, _body, state} when not restarted ->
+        drain_pending_use(state, deadline, true)
+
+      {:ok, _body, state} ->
+        drain_pending_use(%{state | pending_use: rest}, deadline, restarted)
+
+      # The session was gone before its scope was back on. An open transaction
+      # went with it, which the caller has to hear about; otherwise the whole
+      # scope goes onto a fresh session, once, as above.
+      {:gone, state} ->
+        cond do
+          state.in_transaction ->
+            {:error, transaction_gone(statement), lose_transaction(forget_session(state))}
+
+          restarted ->
+            {:error, refused_fresh(statement), forget_session(state)}
+
+          true ->
+            drain_pending_use(forget_session(state), deadline, true)
+        end
+
+      {:error, error, state} ->
+        {:error, error, state}
     end
   end
 
-  # The engine reclaims a session once it has been idle long enough, then quietly
-  # builds a fresh one for the id we keep sending — losing the scope we selected.
-  # Nothing in the reply gives it away: the id we sent is echoed back either way.
-  # So past the limit the only safe reading is that the session is new, and the
-  # DSN's defaults go back on.
+  # One statement, recovered as a lost session allows (see recover/4), with what
+  # it leaves on the session noted once it has run.
+  defp run(state, statement, deadline, count \\ nil) do
+    case round_trip(state, statement, deadline, count) do
+      {:gone, state} -> recover(state, statement, deadline, count)
+      answer -> answer
+    end
+    |> track(statement)
+  end
+
+  # The engine no longer holds the session — it expired, was released, or went
+  # with a restart — and nothing ran. With a transaction or a moved context gone
+  # with it, re-running would put the statement somewhere its author did not
+  # intend, so the loss is reported instead; otherwise a fresh session on the
+  # DSN's scope takes over and the statement is sent once more. Either way the
+  # next statement starts on a fresh session.
+  defp recover(state, statement, deadline, count) do
+    cond do
+      state.in_transaction ->
+        {:error, transaction_gone(statement), lose_transaction(forget_session(state))}
+
+      state.dirty ->
+        {:error, context_gone(statement), forget_session(state)}
+
+      true ->
+        with {:ok, state} <- drain_pending_use(forget_session(state), deadline) do
+          case round_trip(state, statement, deadline, count) do
+            {:gone, state} -> {:error, refused_fresh(statement), forget_session(state)}
+            answer -> answer
+          end
+        end
+    end
+  end
+
+  # A session the engine no longer holds, and everything it held, forgotten: the
+  # next request starts a fresh one, with the DSN's scope put back on first.
+  defp forget_session(state) do
+    %{
+      state
+      | session_id: nil,
+        dirty: false,
+        in_transaction: false,
+        session_touched: false,
+        pending_use: state.session_defaults
+    }
+  end
+
+  defp lose_transaction(state), do: %{state | auto_commit: true, transaction_lost: true}
+
+  defp transaction_gone(statement) do
+    %SessionLostError{
+      message:
+        "the engine no longer holds this connection's session (it expired, was released, " <>
+          "or the server restarted), so its open transaction is gone; the statement did not run",
+      statement: statement
+    }
+  end
+
+  defp context_gone(statement) do
+    %SessionLostError{
+      message:
+        "the engine no longer holds this connection's session (it expired, was released, " <>
+          "or the server restarted), and the context set up on it (USE, SET, ALTER SESSION " <>
+          "or a temporary object) went with it, so the statement was not re-run; the next " <>
+          "statement starts a fresh session on the DSN's scope",
+      statement: statement
+    }
+  end
+
+  defp refused_fresh(statement) do
+    %SessionLostError{
+      message: "the engine refused a session it had just started",
+      statement: statement
+    }
+  end
+
+  # What a statement that ran leaves on the session: a moved context, or a
+  # transaction opened or ended.
+  defp track({:ok, body, state}, statement) do
+    state =
+      statement
+      |> SQL.split_statements()
+      |> Enum.reduce(state, fn piece, state ->
+        state = if SQL.touches_session?(piece), do: %{state | dirty: true}, else: state
+
+        case SQL.transaction_effect(piece) do
+          :begins -> %{state | in_transaction: true}
+          :ends -> %{state | in_transaction: false}
+          :none -> state
+        end
+      end)
+
+    {:ok, body, state}
+  end
+
+  defp track(answer, _statement), do: answer
+
+  # An engine before 0.1.0 reclaims a session once it has been idle long enough,
+  # then quietly builds a fresh one for the id we keep sending — losing the scope
+  # we selected — and nothing in its answer gives that away. So past the limit
+  # the safe reading is that the session is new, and the DSN's defaults go back
+  # on ahead of the statement.
+  #
+  # An engine that marks its answers `newSession` is sent `requireSession`
+  # instead, and refuses a session it no longer holds before anything runs (see
+  # recover/4), so it needs no guessing; and until an answer has said which kind
+  # of engine this is, no session has been named to guess about.
   #
   # Not once the caller has selected a scope themselves: putting our defaults
   # over their choice is its own surprise.
+  defp restore_session_defaults(%State{tracks_sessions: tracks} = state) when tracks != false,
+    do: state
+
   defp restore_session_defaults(%State{session_defaults: []} = state), do: state
   defp restore_session_defaults(%State{session_touched: true} = state), do: state
   defp restore_session_defaults(%State{config: %Config{idle_limit: 0}} = state), do: state
@@ -369,9 +588,18 @@ defmodule Frostlake.Connection do
   end
 
   defp round_trip(state, sql, deadline, count \\ nil) do
+    # Only an answer to a request naming a session can say it was replaced: the
+    # very first request always starts one.
+    held = state.session_id != nil
+
     payload =
       %{"sql" => sql, "autoCommit" => state.auto_commit}
       |> maybe_put("sessionId", state.session_id)
+      # Resume the session or refuse: otherwise an engine that no longer holds it
+      # starts a fresh one under the same id, at the server's default scope.
+      # Only for an engine known to mark `newSession`: one before 0.1.0 may refuse
+      # a field it does not know.
+      |> maybe_put("requireSession", if(held and state.tracks_sessions == true, do: true))
       |> maybe_put("multiStatementCount", count)
       |> JSON.encode_to_iodata()
 
@@ -380,24 +608,17 @@ defmodule Frostlake.Connection do
     case perform(state, "POST", @execute_path, payload, deadline) do
       {:ok, status, response, state} ->
         case decode_body(endpoint, status, response) do
-          {:ok, body} ->
-            # Any answer proves the session was alive just now, which is what the
-            # idle limit measures: a statement the engine refused is still a
-            # statement it answered.
-            state = remember_session(state, body)
-            state = %{state | last_used_at: System.monotonic_time(:millisecond)}
-
-            if body["success"] == true do
-              {:ok, body, state}
+          {:ok, body} when status == 404 and held ->
+            if session_refused?(body) do
+              # The engine refused the session it was asked to resume, as one it
+              # no longer holds (`requireSession`): nothing ran.
+              {:gone, state}
             else
-              error = %QueryError{
-                message: failure_message(body, status, response),
-                statement: sql,
-                status: status
-              }
-
-              {:error, error, state}
+              answered(state, body, held, sql, status, response)
             end
+
+          {:ok, body} ->
+            answered(state, body, held, sql, status, response)
 
           {:error, error} ->
             {:error, error, state}
@@ -405,6 +626,28 @@ defmodule Frostlake.Connection do
 
       {:error, error, state} ->
         {:error, error, state}
+    end
+  end
+
+  defp session_refused?(body), do: body["success"] != true and body["sessionId"] == nil
+
+  defp answered(state, body, held, sql, status, response) do
+    # Any answer proves the session was alive just now, which is what the idle
+    # limit measures: a statement the engine refused is still a statement it
+    # answered.
+    state = remember_session(state, body, held)
+    state = %{state | last_used_at: System.monotonic_time(:millisecond)}
+
+    if body["success"] == true do
+      {:ok, body, state}
+    else
+      error = %QueryError{
+        message: failure_message(body, status, response),
+        statement: sql,
+        status: status
+      }
+
+      {:error, error, state}
     end
   end
 
@@ -539,11 +782,45 @@ defmodule Frostlake.Connection do
     }
   end
 
-  defp remember_session(state, body) do
+  defp remember_session(state, body, held) do
     case body["sessionId"] do
-      session when is_binary(session) and session != "" -> %{state | session_id: session}
-      _ -> state
+      session when is_binary(session) and session != "" ->
+        note_new_session(%{state | session_id: session}, body["newSession"], held)
+
+      _ ->
+        state
     end
+  end
+
+  # From engine 0.1.0 on, an answer naming a session says whether the statement
+  # ran in one the engine had only just started. To a request naming ours that
+  # means ours was gone — idle past the engine's limit, released, or lost to a
+  # restart — and the statement ran in a fresh session at the server's default
+  # scope. It has run, and nothing takes that back; what can be done is to put
+  # the DSN's scope back on before the next statement. A USE of the caller's own
+  # went with the old session, so it no longer holds the defaults off.
+  #
+  # The mark's presence is also what says the engine can release a session on
+  # close; an answer without one comes from an engine before 0.1.0.
+  defp note_new_session(state, true, true) do
+    state = if state.in_transaction, do: lose_transaction(state), else: state
+
+    %{
+      state
+      | tracks_sessions: true,
+        pending_use: state.session_defaults,
+        session_touched: false,
+        dirty: false,
+        in_transaction: false
+    }
+  end
+
+  defp note_new_session(state, mark, _held) when is_boolean(mark) do
+    %{state | tracks_sessions: true}
+  end
+
+  defp note_new_session(state, _mark, _held) do
+    %{state | tracks_sessions: state.tracks_sessions || false}
   end
 
   # Never returns the empty string: a response can report failure carrying no

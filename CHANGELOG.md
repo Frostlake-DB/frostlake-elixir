@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- `close/1` hands the session back to the engine with `DELETE /api/sessions/{id}`, and so does a
+  connection whose owner finishes. A closed connection's session no longer waits for the engine's
+  30-minute idle sweep, and the engine rolls back a transaction left open in it. The release is
+  best effort: it waits no longer than the connection's timeout or five seconds, whichever is
+  shorter, and `close/1` answers `:ok` whatever the engine says. Engines before 0.1.0 have no such
+  endpoint and are not asked.
+- When engine 0.1.0 answers `newSession` for a session the connection already held, because its
+  own was reaped, released or lost to a restart, the DSN's role, warehouse, database and schema go
+  back on before the next statement. Before, the connection carried on at the server's default
+  scope unless it had sat idle past `idleLimit`, and a `USE` of the caller's own kept even that
+  off.
+- Once an answer shows the engine marks `newSession` (0.1.0 and later), every request naming the
+  session carries `requireSession: true`; an older engine is never sent it. A session the engine
+  no longer holds is then refused before anything runs, and the connection puts the DSN's scope on
+  a fresh session and sends the statement once more. When the lost session held an open
+  transaction or a moved context (`USE`, `SET`/`UNSET`, `ALTER SESSION`, a temporary object, a
+  `CREATE`/`DROP` of a database or schema), the statement is not re-run and the call answers the
+  new `Frostlake.SessionLostError`; a `commit/2` of a transaction lost that way answers it too,
+  rather than `:ok`. The connection stays usable either way, its next statement starting a fresh
+  session on the DSN's scope.
+- The `idleLimit` check now applies only to engines before 0.1.0, whose answers never say that a
+  session was lost; a later engine refuses a lost session instead.
+
 ## 0.1.0
 
 First release. A dependency-free Elixir driver for Frostlake over the engine's HTTP protocol,
