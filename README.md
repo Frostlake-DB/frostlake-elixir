@@ -21,11 +21,11 @@ From [Hex](https://hex.pm/packages/frostlake):
 
 ```elixir
 def deps do
-  [{:frostlake, "~> 0.1.0"}]
+  [{:frostlake, "~> 0.2.0"}]
 end
 ```
 
-A script or a Livebook can pull it in with `Mix.install([{:frostlake, "~> 0.1.0"}])`.
+A script or a Livebook can pull it in with `Mix.install([{:frostlake, "~> 0.2.0"}])`.
 
 ## Usage
 
@@ -361,7 +361,7 @@ the engine jar and its dependency jars, joined with `:` (`;` on Windows):
 JAVA_HOME=/path/to/jdk17 FROSTLAKE_CLASSPATH="<engine jar>:<dependency jars>" mix test
 ```
 
-Against engines 0.0.7 and 0.1.0 that run passes with no failures: **33 integration tests** on top
+Against engine 0.2.0 that run passes with no failures: **33 integration tests** on top
 of the unit tests, every statement travelling `connect` → HTTP → `DatabaseHttpServer`.
 
 With `FL_CORPUS` set to the frostlake repo's `engine/src/test/resources/testkit`, best given as an

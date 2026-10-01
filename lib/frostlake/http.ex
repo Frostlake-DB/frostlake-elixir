@@ -16,7 +16,7 @@ defmodule Frostlake.HTTP do
   @type socket :: {:tcp, :gen_tcp.socket()} | {:ssl, :ssl.sslsocket()}
   @type deadline :: integer() | :infinity
 
-  @user_agent "frostlake-elixir/0.1.0"
+  @user_agent "frostlake-elixir/0.2.0"
 
   @doc "Opens a socket to the server the config names."
   @spec connect(Config.t()) :: {:ok, socket()} | {:error, term()}

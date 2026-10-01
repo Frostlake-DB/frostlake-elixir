@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - `close/1` hands the session back to the engine with `DELETE /api/sessions/{id}`, and so does a
   connection whose owner finishes. A closed connection's session no longer waits for the engine's
@@ -24,6 +24,7 @@
   session on the DSN's scope.
 - The `idleLimit` check now applies only to engines before 0.1.0, whose answers never say that a
   session was lost; a later engine refuses a lost session instead.
+- Requires a Frostlake engine 0.2.0 or newer.
 
 ## 0.1.0
 
