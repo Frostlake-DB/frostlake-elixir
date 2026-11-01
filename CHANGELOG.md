@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1
+
+- A name is read whole, so the `$$` in `a$$b` opens no body, and a line comment ends at a carriage
+  return as well as a line feed, as the engine's lexer reads them. A `?`, a `USE` or a `BEGIN`
+  behind either is now seen.
+- A negative `Decimal` bind goes out in parentheses, so `3-?` no longer reads as a line comment.
+
 ## 0.2.0
 
 - `close/1` hands the session back to the engine with `DELETE /api/sessions/{id}`, and so does a

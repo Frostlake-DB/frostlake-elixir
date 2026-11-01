@@ -28,6 +28,20 @@ defmodule Frostlake.SQLTest do
     test "multi-byte text does not shift the offsets" do
       assert SQL.split_statements("SELECT 'zażółć'; SELECT 2") == ["SELECT 'zażółć'", " SELECT 2"]
     end
+
+    test "a line comment ends at a lone carriage return too" do
+      assert SQL.split_statements("SELECT 1 -- a\r; SELECT 2") == ["SELECT 1 -- a\r", " SELECT 2"]
+      assert SQL.split_statements("SELECT 1 // a\r; SELECT 2") == ["SELECT 1 // a\r", " SELECT 2"]
+    end
+
+    test "a name is read whole, so only dollars outside one open a body" do
+      assert SQL.split_statements("SELECT A$$B; SELECT 2") == ["SELECT A$$B", " SELECT 2"]
+      # A $$ right after a number or a closed body does open one.
+      assert SQL.split_statements("SELECT 1$$;$$; SELECT 2") == ["SELECT 1$$;$$", " SELECT 2"]
+
+      assert SQL.split_statements("SELECT $$a$$$$;$$; SELECT 2") ==
+               ["SELECT $$a$$$$;$$", " SELECT 2"]
+    end
   end
 
   describe "changes_session_scope?/1" do
@@ -59,6 +73,11 @@ defmodule Frostlake.SQLTest do
     test "a leading comment does not hide the verb" do
       assert SQL.changes_session_scope?("-- switch\nUSE SCHEMA other")
       assert SQL.changes_session_scope?("/* switch */ USE SCHEMA other")
+    end
+
+    test "nor does a comment closed by a carriage return" do
+      assert SQL.changes_session_scope?("-- switch\rUSE SCHEMA other")
+      assert SQL.changes_session_scope?("SELECT 1 -- c\r; USE SCHEMA other")
     end
 
     test "a statement that only mentions the words does not count" do
@@ -126,6 +145,12 @@ defmodule Frostlake.SQLTest do
       assert SQL.leading_words("SELECT 1", 6) == ["SELECT", "1"]
       assert SQL.leading_words("", 6) == []
       assert SQL.leading_words("'literal' first", 6) == []
+    end
+
+    test "a line comment closed by a carriage return is stepped over" do
+      assert SQL.leading_words("-- c\rUSE DATABASE d", 2) == ["USE", "DATABASE"]
+      assert SQL.touches_session?("-- c\rCREATE TEMP TABLE t (a INT)")
+      assert SQL.transaction_effect("-- c\rBEGIN") == :begins
     end
   end
 end

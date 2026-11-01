@@ -21,11 +21,11 @@ From [Hex](https://hex.pm/packages/frostlake):
 
 ```elixir
 def deps do
-  [{:frostlake, "~> 0.2.0"}]
+  [{:frostlake, "~> 0.2.1"}]
 end
 ```
 
-A script or a Livebook can pull it in with `Mix.install([{:frostlake, "~> 0.2.0"}])`.
+A script or a Livebook can pull it in with `Mix.install([{:frostlake, "~> 0.2.1"}])`.
 
 ## Usage
 

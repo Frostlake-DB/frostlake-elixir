@@ -20,16 +20,22 @@ defmodule Frostlake.SQL do
   def word_char?(byte) when is_word_char(byte), do: true
   def word_char?(_byte), do: false
 
-  @doc """
-  Whether a comment or a quoted region opens at `index`, and where it ends.
+  # Whether an unquoted identifier can start with `byte`.
+  defguardp is_name_start(byte) when byte == ?_ or byte in ?a..?z or byte in ?A..?Z
 
-  Returns the index just past the region, or `-1` when `index` does not open
-  one. Every walk over a statement starts here, so none of them can forget a
-  case.
+  @doc """
+  Whether a comment, a quoted region or a name opens at `index`, and where it
+  ends.
+
+  Returns the index just past it, or `-1` when `index` does not open one. Every
+  walk over a statement starts here, so none of them can forget a case.
   """
   @spec skip_enclosure(binary(), non_neg_integer()) :: integer()
   def skip_enclosure(sql, index) do
     case :binary.at(sql, index) do
+      # A name is read whole, as the lexer reads one, so a `$` inside it — the
+      # `$$` in `A$$B` — opens no dollar-quoted body.
+      byte when is_name_start(byte) -> skip_name(sql, index)
       ?' -> skip_string(sql, index)
       ?" -> skip_quoted(sql, index)
       ?$ -> if opens_dollar_quote?(sql, index), do: skip_dollar_quoted(sql, index), else: -1
@@ -94,16 +100,24 @@ defmodule Frostlake.SQL do
   end
 
   @doc """
-  Whether the `$` at `index` opens a dollar-quoted body.
+  The index just past the unquoted identifier starting at `index`, read as the
+  lexer reads one: `[A-Za-z_][A-Za-z0-9_$]*`.
 
-  A `$` is legal inside an unquoted identifier, so `A$$B` is a name rather than
-  the start of a body: a real delimiter is never preceded by an identifier
-  character.
+  A `$` is legal inside an unquoted identifier, so `A$$B` is one name rather
+  than a name and the start of a body.
+  """
+  @spec skip_name(binary(), non_neg_integer()) :: non_neg_integer()
+  def skip_name(sql, index), do: word_end(sql, index + 1, byte_size(sql))
+
+  @doc """
+  Whether the `$` at `index` opens a dollar-quoted body: whether another `$`
+  follows it.
+
+  The `$$` inside a name such as `A$$B` opens none, but `skip_enclosure/2` reads
+  a name whole, so a walk over a statement never stops inside one to ask.
   """
   @spec opens_dollar_quote?(binary(), non_neg_integer()) :: boolean()
-  def opens_dollar_quote?(sql, index) do
-    peek(sql, index + 1) == ?$ and (index == 0 or not word_char?(:binary.at(sql, index - 1)))
-  end
+  def opens_dollar_quote?(sql, index), do: peek(sql, index + 1) == ?$
 
   @doc """
   The index just past the `$$…$$` body starting at `index`.
@@ -114,9 +128,16 @@ defmodule Frostlake.SQL do
   @spec skip_dollar_quoted(binary(), non_neg_integer()) :: non_neg_integer()
   def skip_dollar_quoted(sql, index), do: find(sql, "$$", index + 2, 2)
 
-  @doc "The index just past the line comment starting at `index`."
+  @doc """
+  The index just past the line comment starting at `index` and the line end
+  that closes it.
+
+  The comment ends at a line feed or a carriage return, whichever comes first,
+  as the lexer's `('--' | '//') ~[\\r\\n]*` does: a lone carriage return ends it
+  too.
+  """
   @spec skip_line(binary(), non_neg_integer()) :: non_neg_integer()
-  def skip_line(sql, index), do: find(sql, "\n", index, 1)
+  def skip_line(sql, index), do: find(sql, ["\n", "\r"], index, 1)
 
   @doc "The index just past the block comment starting at `index`."
   @spec skip_block_comment(binary(), non_neg_integer()) :: non_neg_integer()

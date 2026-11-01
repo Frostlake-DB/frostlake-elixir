@@ -343,7 +343,7 @@ defmodule Frostlake.Binding do
 
   def format(%module{} = value) do
     if module == Decimal and Code.ensure_loaded?(module) do
-      apply(module, :to_string, [value, :normal])
+      numeral(apply(module, :to_string, [value, :normal]))
     else
       raise UsageError, message: "unsupported bind type #{inspect(module)}"
     end

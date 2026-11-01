@@ -1,3 +1,16 @@
+# A stand-in for the optional Decimal package, which the driver does not depend
+# on: only the calls these tests and Binding.format/1 make, so the %Decimal{}
+# clause can be checked without fetching anything.
+unless Code.ensure_loaded?(Decimal) do
+  defmodule Decimal do
+    @moduledoc false
+    defstruct [:text]
+
+    def new(text) when is_binary(text), do: %__MODULE__{text: text}
+    def to_string(%__MODULE__{text: text}, :normal), do: text
+  end
+end
+
 defmodule Frostlake.BindingTest do
   use ExUnit.Case, async: true
 
@@ -17,6 +30,24 @@ defmodule Frostlake.BindingTest do
 
     test "a $ inside an identifier does not open a dollar-quoted body" do
       assert Binding.placeholder_count("SELECT A$$B, ?") == 1
+    end
+
+    test "a name is read whole, so only dollars outside one open a body" do
+      assert Binding.substitute("SELECT 1 AS a$$b, ?", [7]) == "SELECT 1 AS a$$b, 7"
+
+      assert Binding.substitute("SELECT a$$b, ? FROM t$$ WHERE c$ = ?", [7, 8]) ==
+               "SELECT a$$b, 7 FROM t$$ WHERE c$ = 8"
+
+      # A $$ right after a number or a positional reference does open one.
+      assert Binding.substitute("SELECT 1$$?$$, ?", [7]) == "SELECT 1$$?$$, 7"
+      assert Binding.substitute("SELECT $1$$?$$, ?", [7]) == "SELECT $1$$?$$, 7"
+    end
+
+    test "a line comment ends at a carriage return as well as a line feed" do
+      assert Binding.substitute("SELECT 1 -- c\r, ?", [7]) == "SELECT 1 -- c\r, 7"
+      assert Binding.substitute("SELECT 1 // c?\r\n, ?", [7]) == "SELECT 1 // c?\r\n, 7"
+      assert Binding.substitute("SELECT 1 -- c?\n, ?", [7]) == "SELECT 1 -- c?\n, 7"
+      assert Binding.substitute("SELECT 1 -- c\r, :x", %{x: 7}) == "SELECT 1 -- c\r, 7"
     end
 
     test "finds named markers, and counts a repeated one once" do
@@ -114,6 +145,23 @@ defmodule Frostlake.BindingTest do
       # Bare after a minus, -5 turned `3-?` into the comment `3--5`.
       assert Binding.substitute("SELECT 3-?", [-5]) == "SELECT 3-(-5)"
       assert Binding.substitute("SELECT 3-?", [5]) == "SELECT 3-5"
+    end
+
+    test "stay one value wherever they land, whatever their type" do
+      # Bare, ?::VARCHAR would cast before it negates.
+      assert Binding.substitute("SELECT ?::VARCHAR", [-5]) == "SELECT (-5)::VARCHAR"
+
+      assert Binding.substitute("SELECT 3-?, ?::VARCHAR", [-2.5, -2.5]) ==
+               "SELECT 3-(-2.5), (-2.5)::VARCHAR"
+
+      assert Binding.substitute("SELECT 3-?", [-123_456_789_012_345_678_901_234_567_890]) ==
+               "SELECT 3-(-123456789012345678901234567890)"
+
+      # Negative zero is not below zero, but it is written with a minus.
+      assert Binding.format(-0.0) == "(-0.0)"
+      assert Binding.format(Decimal.new("-2.5")) == "(-2.5)"
+      assert Binding.substitute("SELECT 3-?", [Decimal.new("-2.5")]) == "SELECT 3-(-2.5)"
+      assert Binding.format(Decimal.new("2.5")) == "2.5"
     end
 
     test "an empty map binds nothing, like an empty list" do
